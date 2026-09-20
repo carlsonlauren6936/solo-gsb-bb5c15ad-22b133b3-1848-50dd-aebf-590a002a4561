@@ -1138,3 +1138,140 @@ class DnssecRolloverCheckOut(BaseModel):
         description="等待不足的阶段（按阶段顺序；safe 为 true 时为空）"
     )
     note: str
+
+
+# ---------- 区域切割与胶水记录预检 ----------
+
+
+class ZoneCutRR(BaseModel):
+    """扁平 RR 列表中的单条资源记录（区域切割预检的最小单位）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description=(
+            "属主名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签；"
+            "须在区域内，否则整体请求返回 422）"
+        ),
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["A"],
+        description="记录类型助记符（规范化：去首尾空白、转大写）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: str = Field(
+        min_length=1,
+        examples=["192.0.2.1"],
+        description=(
+            "单条记录数据（规范化：去首尾空白，不能为空；NS 记录的 rdata 为 "
+            "NS 目标名，按属主名规则规范化并校验，且须在区域内）"
+        ),
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        return normalize_rr_token(value)
+
+    @field_validator("rdata")
+    @classmethod
+    def _check_rdata(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("rdata 不能为空字符串")
+        return text
+
+    @model_validator(mode="after")
+    def _normalize_ns_target(self) -> "ZoneCutRR":
+        if self.type == "NS":
+            try:
+                self.rdata = validate_owner(self.rdata)
+            except ValueError as exc:
+                raise ValueError("非法的 NS 目标名") from exc
+        return self
+
+
+class ZoneCutCheckCreate(BaseModel):
+    """区域切割与胶水记录预检请求（仅计算，不写库）。"""
+
+    records: list[ZoneCutRR] = Field(
+        max_length=4096,
+        description="扁平 RR 列表（可为空、至多 4096 条；每条为 owner/type/class/ttl/rdata 五元组）",
+    )
+
+
+class ZoneCutRecord(BaseModel):
+    """预检保留的单条规范化记录（authoritative 或 glue）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    ttl: int
+    rdata: str
+
+
+class ZoneCutViolation(BaseModel):
+    """被切割遮蔽或失去委派引用的单条记录。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    ttl: int
+    rdata: str
+    classification: Literal["occluded", "orphan_glue"] = Field(
+        description="occluded=切割遮蔽的普通记录；orphan_glue=未被该委派引用的切割下地址记录"
+    )
+    cut: str = Field(description="遮蔽该记录的最近切割点（委派属主名）")
+    message: str
+
+
+class ZoneCutCounts(BaseModel):
+    """逐分类计数（authoritative + glue + occluded + orphan_glue = total）。"""
+
+    total: int = Field(ge=0, description="提交的记录总数")
+    authoritative: int = Field(ge=0, description="保留为权威数据的记录数（含切割点 NS）")
+    glue: int = Field(ge=0, description="保留为胶水的记录数")
+    occluded: int = Field(ge=0, description="被切割遮蔽的普通记录数")
+    orphan_glue: int = Field(ge=0, description="未被委派引用的切割下地址记录数")
+
+
+class ZoneCutCheckOut(BaseModel):
+    """区域切割与胶水记录预检（200）响应体。"""
+
+    zone: str
+    counts: ZoneCutCounts
+    authoritative_records: list[ZoneCutRecord] = Field(
+        description="保留为权威数据的规范化记录（按 owner/type/rdata 稳定排序）"
+    )
+    glue_records: list[ZoneCutRecord] = Field(
+        description="保留为胶水的规范化记录（按 owner/type/rdata 稳定排序）"
+    )
+    violations: list[ZoneCutViolation] = Field(
+        description="逐条违规记录（occluded/orphan_glue，按 owner/type/rdata 稳定排序）"
+    )
+    note: str

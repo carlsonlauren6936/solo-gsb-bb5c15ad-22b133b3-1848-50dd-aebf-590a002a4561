@@ -14,6 +14,7 @@
 - 提供 **权威快照一致性检查**（`POST /api/zones/{zone}/snapshot-consistency`，仅检查不写库）：接收多个权威节点的 RRset 快照（owner、type、class、ttl、rdata）与最小同意节点数 `min_agreeing`，将属主名规范化为小写无尾点、类型与类大写、rdata 去重排序后，按 RRset 统计各取值（含"缺席"）的同意节点数，取**唯一最高票**且达到门槛的值为共识；返回可发布的共识快照、逐节点差异（mismatch/missing/extra）与冲突 RRset；任一 RRset 最高票未达门槛或达到门槛但并列时返回 **409** 并列出各取值的投票分布。
 - 提供 **IXFR 增量回放预演**（`POST /api/zones/{zone}/ixfr-replays`，仅预演不写库）：提交起始 serial、初始 RRset 集合与有序 delta 列表，校验 serial 链（每个 delta 的 `from_serial` 必须等于当前 serial、`to_serial` 必须为 RFC 1982 有效前进），RR 规范化后以 `(owner, type, class, ttl, rdata)` 五元组为同一性判据，单个 delta 内**先删除再新增**；删除不存在的 RR 或新增已存在的 RR 时返回 **409** 并给出 delta 下标、失败操作与该 delta 前的完整快照（该 delta 原子作废，不留半步修改）；成功时返回最终 serial、规范化快照与每步增删计数。
 - 提供 **ZSK 双签轮换时序校验**（`POST /api/zones/{zone}/dnssec-rollover-checks`，仅校验不写库）：提交新钥发布/启签、旧钥停签/移除四个 UTC 时刻（须严格递增，否则 **422**）与 DNSKEY TTL、区记录最大 TTL、允许时钟偏差，校验"发布 → 启签至少等待 `DNSKEY TTL + 时钟偏差`、停签 → 移除至少等待 `区记录最大 TTL + 时钟偏差`"；返回 `safe`、两阶段实际/要求秒数与最早安全时间，等待不足仍返回 **200** 并按阶段顺序列出 `violations`。
+- 提供 **区域切割与胶水记录预检**（`POST /api/zones/{zone}/zone-cut-checks`，仅计算不写库）：提交扁平 RR 列表，非区域顶点的 NS 记录被识别为委派切割，每条记录按最长后缀定位最近切割——切割点 NS 保留为 `authoritative`，切割下普通记录标为 `occluded`，只有 owner 恰为该委派 NS 目标且类型为 A/AAAA 的区内记录保留为 `glue`，未被该委派引用的切割下地址记录标为 `orphan_glue`；返回规范化后的 `authoritative_records`、`glue_records`、逐条 `violations` 与分类计数（均按 owner/type/rdata 稳定排序）；区域外 owner 或 NS 目标返回 **422**。
 
 ## 快速启动（单条命令）
 
@@ -53,6 +54,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/snapshot-consistency` | 权威快照一致性检查，不写库（200；任一 RRset 未达成唯一多数共识返回 409） |
 | `POST` | `/api/zones/{zone}/ixfr-replays` | IXFR 增量回放预演，不写库（200；删除不存在/新增已存在的 RR 返回 409；serial 链非法返回 422） |
 | `POST` | `/api/zones/{zone}/dnssec-rollover-checks` | ZSK 双签轮换时序校验，不写库（200，等待不足仍返回 200 并列出 violations；四个时刻未严格递增返回 422） |
+| `POST` | `/api/zones/{zone}/zone-cut-checks` | 区域切割与胶水记录预检，不写库（200；区域外属主或 NS 目标返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -733,6 +735,83 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/dnssec-rollover-chec
 
 - 四个时刻未严格递增（相等或倒退）、TTL/时钟偏差越界或为负、时间格式非法、缺少字段等请求问题返回 **422**；路径中区域名非法返回 **400**。
 
+### 区域切割与胶水记录预检
+
+`POST /api/zones/{zone}/zone-cut-checks` 用于**发布前**核对一份扁平 RR 列表在委派切割下的可见性：非区域顶点（zone apex）的 NS 记录被识别为**委派切割**，每条记录按**最长后缀**定位其最近切割并分类。结果**仅即时计算，不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `records` | 扁平 RR 列表（可空、至多 4096 条）；每条含 `owner`、`type`、`class`、`ttl`（`0..2147483647`）与单条 `rdata` |
+
+规范化规则（与快照一致性检查一致）：`owner` 去首尾空白、去末尾根点并转小写（允许前导下划线标签）；`type` / `class` 去首尾空白并转大写；`rdata` 去首尾空白（空白串报错）；**NS 记录的 `rdata` 作为 NS 目标名**，同样按属主名规则规范化并校验。
+
+分类规则：
+
+1. **区域归属**：所有记录的属主名、以及所有 NS 记录的目标都必须在区域内（等于区域名或为其子域），否则整体请求返回 **422**（`detail.reason` 为 `out_of_zone_name`，并列出越界记录）；
+2. **委派切割**：属主名不是区域顶点的 NS 记录即切割点；同一切割点的全部 NS 记录的 rdata 构成该委派的 **NS 目标集合**；
+3. **最近切割**：每条记录按最长后缀匹配定位最近切割（切割点名等于记录属主或为其祖先域，取最长者）；
+4. **逐条分类**：
+   - 不在任何切割之下 → `authoritative`（含区域顶点 NS）；
+   - 切割点上的 NS 记录 → `authoritative`（切割点 NS 保留）；
+   - 切割之下（含切割点）的 **A/AAAA** 记录，属主**恰为**该委派 NS 目标 → `glue`（作为胶水保留）；
+   - 切割之下的 A/AAAA 记录但未被该委派引用 → `orphan_glue`（违规）；
+   - 切割之下的其余记录 → `occluded`（违规）。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/zone-cut-checks \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "records": [
+          {"owner": "example.com", "type": "SOA", "class": "IN", "ttl": 3600,
+           "rdata": "ns1.example.com. hostmaster.example.com. 2026092001 7200 3600 1209600 300"},
+          {"owner": "example.com", "type": "NS", "class": "IN", "ttl": 3600,
+           "rdata": "ns1.example.com."},
+          {"owner": "ns1.example.com", "type": "A", "class": "IN", "ttl": 300,
+           "rdata": "192.0.2.53"},
+          {"owner": "sub.example.com", "type": "NS", "class": "IN", "ttl": 3600,
+           "rdata": "ns1.sub.example.com."},
+          {"owner": "ns1.sub.example.com", "type": "A", "class": "IN", "ttl": 300,
+           "rdata": "192.0.2.1"},
+          {"owner": "ns2.sub.example.com", "type": "A", "class": "IN", "ttl": 300,
+           "rdata": "192.0.2.2"},
+          {"owner": "mail.sub.example.com", "type": "MX", "class": "IN", "ttl": 300,
+           "rdata": "10 mail.example.com."}
+        ]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "counts": {"total": 7, "authoritative": 4, "glue": 1, "occluded": 1, "orphan_glue": 1},
+  "authoritative_records": [
+    {"owner": "example.com", "type": "NS", "class": "IN", "ttl": 3600, "rdata": "ns1.example.com"},
+    {"owner": "example.com", "type": "SOA", "class": "IN", "ttl": 3600,
+     "rdata": "ns1.example.com. hostmaster.example.com. 2026092001 7200 3600 1209600 300"},
+    {"owner": "ns1.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.53"},
+    {"owner": "sub.example.com", "type": "NS", "class": "IN", "ttl": 3600, "rdata": "ns1.sub.example.com"}
+  ],
+  "glue_records": [
+    {"owner": "ns1.sub.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.1"}
+  ],
+  "violations": [
+    {"owner": "mail.sub.example.com", "type": "MX", "class": "IN", "ttl": 300,
+     "rdata": "10 mail.example.com.", "classification": "occluded", "cut": "sub.example.com",
+     "message": "记录位于委派切割 sub.example.com 之下，既不是切割点 NS 也不是该委派的胶水记录，发布后将被切割遮蔽"},
+    {"owner": "ns2.sub.example.com", "type": "A", "class": "IN", "ttl": 300,
+     "rdata": "192.0.2.2", "classification": "orphan_glue", "cut": "sub.example.com",
+     "message": "地址记录位于委派切割 sub.example.com 之下，但属主未被该委派的 NS 目标引用，属于孤儿胶水"}
+  ],
+  "note": "预检结果仅依据本次请求即时计算，不写入数据库；非区域顶点的 NS 记录即委派切割，每条记录按最长后缀定位最近切割：切割点 NS 保留为 authoritative，切割下属主恰为该委派 NS 目标的 A/AAAA 记录保留为 glue，切割下未被该委派引用的地址记录记为 orphan_glue，切割下其余记录记为 occluded"
+}
+```
+
+- `authoritative_records` / `glue_records` / `violations` 均按 `(owner, type, rdata)` **稳定排序**（键相同保持提交顺序）；`counts` 给出四类计数，其和等于 `total`；
+- 嵌套委派（如 `sub.example.com` 与 `deep.sub.example.com`）按**最长后缀**归属最近切割：切割下的地址记录只被**该**委派的 NS 目标引用才算 glue；
+- 属主在区域外、或任一 NS 记录的目标在区域外时返回 **422**，`detail` 分别列出 `out_of_zone_owners` 与 `out_of_zone_ns_targets`（含提交下标）；属主/类型/类/TTL/rdata 非法、NS 目标名非法等请求体问题同样返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -773,6 +852,7 @@ app/
   snapshot.py  # 权威快照一致性检查（不落库）
   ixfr.py      # IXFR 增量回放预演（不落库）
   rollover.py    # ZSK 双签轮换时序校验（不落库）
+  zonecut.py   # 区域切割与胶水记录预检（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

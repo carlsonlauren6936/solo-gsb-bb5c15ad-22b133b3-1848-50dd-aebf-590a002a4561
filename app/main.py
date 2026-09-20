@@ -34,6 +34,8 @@ from .schemas import (
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
+    ZoneCutCheckCreate,
+    ZoneCutCheckOut,
     validate_zone,
 )
 from .repair import build_repair_plan
@@ -48,6 +50,7 @@ from .timeline import (
     build_serial_timeline,
 )
 from .transfer import TransferSimulationError, run_transfer_simulation
+from .zonecut import OutOfZoneError, check_zone_cuts
 
 
 def _normalize_zone(zone: str) -> str:
@@ -522,6 +525,47 @@ def create_app(db_path: str | None = None) -> FastAPI:
             payload.max_zone_ttl,
             payload.clock_skew_seconds,
         )
+
+    @app.post(
+        "/api/zones/{zone}/zone-cut-checks",
+        response_model=ZoneCutCheckOut,
+        responses={
+            422: {
+                "description": (
+                    "存在区域外属主或区域外 NS 目标（reason=out_of_zone_name，"
+                    "detail 列出越界记录）；其余请求体字段校验失败同样返回 422"
+                ),
+            }
+        },
+    )
+    def create_zone_cut_check(zone: str, payload: ZoneCutCheckCreate) -> dict:
+        """区域切割与胶水记录预检（仅计算，不写库）。
+
+        提交扁平 RR 列表：非区域顶点的 NS 记录被识别为委派切割，每条记录按
+        最长后缀定位最近切割——切割点 NS 保留为 authoritative；切割下普通
+        记录标为 occluded；只有 owner 恰为该委派 NS 目标且类型为 A/AAAA 的
+        区内记录保留为 glue；未被该委派引用的切割下地址记录标为
+        orphan_glue。返回规范化后的 authoritative_records、glue_records、
+        逐条 violations 与分类计数（均按 owner/type/rdata 稳定排序）。
+        属主或 NS 目标在区域外时返回 422。
+        """
+        zone_name = _normalize_zone(zone)
+        records = [
+            (rr.owner, rr.type, rr.class_, rr.ttl, rr.rdata)
+            for rr in payload.records
+        ]
+        try:
+            return check_zone_cuts(zone_name, records)
+        except OutOfZoneError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "out_of_zone_owners": exc.owners,
+                    "out_of_zone_ns_targets": exc.ns_targets,
+                },
+            ) from exc
 
     return app
 
