@@ -2444,3 +2444,340 @@ def test_concurrent_same_request_id_races_to_one_reservation(tmp_path):
         assert {serial for _, serial in results} == {base + 1}
         rows = c.get("/api/zones/example.com/serial-reservations").json()
         assert len(rows) == 1
+
+
+# ---------- 区域切割与胶水记录预检 ----------
+
+
+def _zc_rr(owner, rtype, rdata, ttl=300, rrclass="IN"):
+    return {"owner": owner, "type": rtype, "class": rrclass, "ttl": ttl, "rdata": rdata}
+
+
+def _zone_cut_payload(**overrides):
+    payload = {
+        "records": [
+            _zc_rr("example.com", "SOA", "ns1.example.com. h.e. 1 2 3 4 5", ttl=3600),
+            _zc_rr("example.com", "NS", "ns1.example.com.", ttl=3600),
+            _zc_rr("ns1.example.com", "A", "192.0.2.53"),
+            _zc_rr("sub.example.com", "NS", "ns1.sub.example.com."),
+            _zc_rr("sub.example.com", "NS", "ns2.example.com."),
+            _zc_rr("ns1.sub.example.com", "A", "192.0.2.1"),
+            _zc_rr("www.sub.example.com", "A", "192.0.2.2"),
+            _zc_rr("mail.sub.example.com", "TXT", "hello"),
+            _zc_rr("www.example.com", "A", "192.0.2.80"),
+        ]
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_zone_cut_basic_classification(client):
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=_zone_cut_payload())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    # 非区域顶点 NS 识别为委派切割，同一切割点的 NS 目标合并
+    assert body["delegation_cuts"] == [
+        {"owner": "sub.example.com",
+         "ns_targets": ["ns1.sub.example.com", "ns2.example.com"]}
+    ]
+    # 权威记录：顶点记录 + 切割点 NS + 不在切割之下的记录，按 owner/type/rdata 排序
+    assert [(r["owner"], r["type"], r["rdata"]) for r in body["authoritative_records"]] == [
+        ("example.com", "NS", "ns1.example.com."),
+        ("example.com", "SOA", "ns1.example.com. h.e. 1 2 3 4 5"),
+        ("ns1.example.com", "A", "192.0.2.53"),
+        ("sub.example.com", "NS", "ns1.sub.example.com."),
+        ("sub.example.com", "NS", "ns2.example.com."),
+        ("www.example.com", "A", "192.0.2.80"),
+    ]
+    # owner 恰为该委派 NS 目标的 A 记录保留为 glue
+    assert [(r["owner"], r["type"], r["rdata"]) for r in body["glue_records"]] == [
+        ("ns1.sub.example.com", "A", "192.0.2.1"),
+    ]
+    # violations 按 owner/type/rdata 排序：occluded 与 orphan_glue 逐条列出
+    assert [(v["category"], v["record"]["owner"], v["index"])
+            for v in body["violations"]] == [
+        ("occluded", "mail.sub.example.com", 7),
+        ("orphan_glue", "www.sub.example.com", 6),
+    ]
+    assert all(v["cut"] == "sub.example.com" for v in body["violations"])
+    assert body["summary"] == {
+        "total": 9, "authoritative": 6, "glue": 1, "occluded": 1, "orphan_glue": 1,
+    }
+    assert sum(v for k, v in body["summary"].items() if k != "total") == 9
+
+
+def test_zone_cut_normalization(client):
+    # 属主/类型大小写、末尾根点被规范化；NS 目标按规范化形式与 glue owner 匹配
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("SUB.Example.COM.", "ns", "NS1.SUB.EXAMPLE.COM."),
+            _zc_rr("NS1.Sub.Example.Com.", "a", "192.0.2.1"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["delegation_cuts"] == [
+        {"owner": "sub.example.com", "ns_targets": ["ns1.sub.example.com"]}
+    ]
+    assert [(r["owner"], r["type"], r["class"]) for r in body["authoritative_records"]] == [
+        ("sub.example.com", "NS", "IN"),
+    ]
+    assert [(r["owner"], r["type"]) for r in body["glue_records"]] == [
+        ("ns1.sub.example.com", "A"),
+    ]
+    assert body["summary"]["glue"] == 1
+
+
+def test_zone_cut_nearest_cut_by_longest_suffix(client):
+    # 嵌套切割：记录归属最长后缀（最近）的切割，glue 判定只看该委派的 NS 目标
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.sub.example.com."),
+            _zc_rr("deep.sub.example.com", "NS", "ns1.deep.sub.example.com."),
+            _zc_rr("ns1.deep.sub.example.com", "A", "192.0.2.10"),
+            _zc_rr("ns1.sub.example.com", "A", "192.0.2.20"),
+            _zc_rr("stray.deep.sub.example.com", "A", "192.0.2.30"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [c["owner"] for c in body["delegation_cuts"]] == [
+        "deep.sub.example.com", "sub.example.com",
+    ]
+    # 两条地址记录分别被各自最近的委派引用
+    assert [(r["owner"], r["rdata"]) for r in body["glue_records"]] == [
+        ("ns1.deep.sub.example.com", "192.0.2.10"),
+        ("ns1.sub.example.com", "192.0.2.20"),
+    ]
+    # stray 虽在深切割之下，但未被 deep 的 NS 目标引用 → orphan_glue
+    (violation,) = body["violations"]
+    assert violation["category"] == "orphan_glue"
+    assert violation["cut"] == "deep.sub.example.com"
+    assert violation["record"]["owner"] == "stray.deep.sub.example.com"
+
+
+def test_zone_cut_aaaa_glue_and_orphan(client):
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.sub.example.com."),
+            _zc_rr("ns1.sub.example.com", "AAAA", "2001:db8::1"),
+            _zc_rr("ns2.sub.example.com", "AAAA", "2001:db8::2"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(r["owner"], r["type"]) for r in body["glue_records"]] == [
+        ("ns1.sub.example.com", "AAAA"),
+    ]
+    assert [(v["category"], v["record"]["owner"]) for v in body["violations"]] == [
+        ("orphan_glue", "ns2.sub.example.com"),
+    ]
+    assert body["summary"]["glue"] == 1
+    assert body["summary"]["orphan_glue"] == 1
+
+
+def test_zone_cut_at_cut_point_non_ns_records(client):
+    # 切割点处的非 NS 记录视同切割之下：普通类型 occluded，未引用地址 orphan_glue
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.example.com."),
+            _zc_rr("sub.example.com", "TXT", "v=spf1 -all"),
+            _zc_rr("sub.example.com", "A", "192.0.2.9"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(r["owner"], r["type"]) for r in body["authoritative_records"]] == [
+        ("sub.example.com", "NS"),
+    ]
+    assert [(v["category"], v["record"]["type"]) for v in body["violations"]] == [
+        ("orphan_glue", "A"),
+        ("occluded", "TXT"),
+    ]
+
+
+def test_zone_cut_glue_at_cut_point_when_target_is_cut(client):
+    # NS 目标恰为切割点本身时，切割点处的 A 记录可作为 glue 保留
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "sub.example.com."),
+            _zc_rr("sub.example.com", "A", "192.0.2.9"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [(r["owner"], r["type"]) for r in body["glue_records"]] == [
+        ("sub.example.com", "A"),
+    ]
+    assert body["violations"] == []
+
+
+def test_zone_cut_target_above_cut_stays_authoritative(client):
+    # NS 目标在区域内但不在切割之下：其地址记录是普通权威记录而非 glue
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.example.com."),
+            _zc_rr("ns1.example.com", "A", "192.0.2.53"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["glue_records"] == []
+    assert [(r["owner"], r["type"]) for r in body["authoritative_records"]] == [
+        ("ns1.example.com", "A"),
+        ("sub.example.com", "NS"),
+    ]
+    assert body["violations"] == []
+
+
+def test_zone_cut_no_delegations(client):
+    # 没有非顶点 NS：无切割，全部记录为权威记录
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("example.com", "NS", "ns1.example.com."),
+            _zc_rr("www.example.com", "A", "192.0.2.80"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["delegation_cuts"] == []
+    assert len(body["authoritative_records"]) == 2
+    assert body["glue_records"] == []
+    assert body["violations"] == []
+    assert body["summary"] == {
+        "total": 2, "authoritative": 2, "glue": 0, "occluded": 0, "orphan_glue": 0,
+    }
+
+
+def test_zone_cut_stable_sort_keeps_input_order_for_ties(client):
+    # owner/type/rdata 相同的记录（ttl 不同）按输入先后顺序保留（稳定排序）
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("www.example.com", "A", "192.0.2.1", ttl=600),
+            _zc_rr("www.example.com", "A", "192.0.2.2", ttl=300),
+            _zc_rr("www.example.com", "A", "192.0.2.1", ttl=300),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 200
+    records = resp.json()["authoritative_records"]
+    assert [(r["rdata"], r["ttl"]) for r in records] == [
+        ("192.0.2.1", 600),
+        ("192.0.2.1", 300),
+        ("192.0.2.2", 300),
+    ]
+
+
+def test_zone_cut_out_of_zone_owner_422(client):
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("www.example.com", "A", "192.0.2.1"),
+            _zc_rr("www.other.com", "A", "192.0.2.2"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "out_of_zone_name"
+    assert detail["out_of_zone_owners"] == [{"index": 1, "owner": "www.other.com"}]
+    assert detail["out_of_zone_ns_targets"] == []
+
+
+def test_zone_cut_out_of_zone_ns_target_422(client):
+    # 委派 NS 与顶点 NS 的目标都必须在区域内
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.other.net."),
+            _zc_rr("example.com", "NS", "ns2.other.net."),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "out_of_zone_name"
+    assert detail["out_of_zone_owners"] == []
+    assert detail["out_of_zone_ns_targets"] == [
+        {"index": 0, "owner": "sub.example.com", "target": "ns1.other.net."},
+        {"index": 1, "owner": "example.com", "target": "ns2.other.net."},
+    ]
+
+
+def test_zone_cut_out_of_zone_owner_and_target_422(client):
+    # 两类越界同时存在时一并列出
+    payload = _zone_cut_payload(
+        records=[
+            _zc_rr("sub.example.com", "NS", "ns1.other.net."),
+            _zc_rr("www.other.com", "A", "192.0.2.2"),
+        ]
+    )
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["out_of_zone_owners"] == [{"index": 1, "owner": "www.other.com"}]
+    assert detail["out_of_zone_ns_targets"] == [
+        {"index": 0, "owner": "sub.example.com", "target": "ns1.other.net."},
+    ]
+
+
+def test_zone_cut_zone_with_trailing_dot_in_path(client):
+    # 路径区域名带末尾根点：规范化后比较，区内记录不受影响
+    resp = client.post(
+        "/api/zones/example.com./zone-cut-checks",
+        json=_zone_cut_payload(
+            records=[
+                _zc_rr("sub.example.com", "NS", "ns1.sub.example.com."),
+                _zc_rr("ns1.sub.example.com", "A", "192.0.2.1"),
+            ]
+        ),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["summary"]["glue"] == 1
+
+
+def test_zone_cut_not_persisted(client):
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=_zone_cut_payload())
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_zone_cut_invalid_zone_400(client):
+    resp = client.post("/api/zones/bad_zone!/zone-cut-checks", json=_zone_cut_payload())
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"records": []},                                            # 空记录列表
+        {},                                                         # 缺 records
+        _zone_cut_payload(records=[
+            _zc_rr("bad_owner!", "A", "192.0.2.1")]),               # 属主非法
+        _zone_cut_payload(records=[
+            _zc_rr("www.example.com", "?", "x")]),                  # 类型非法
+        _zone_cut_payload(records=[
+            _zc_rr("www.example.com", "A", "x", rrclass="?")]),     # 类非法
+        _zone_cut_payload(records=[
+            _zc_rr("www.example.com", "A", "192.0.2.1", ttl=-1)]),  # ttl 下越界
+        _zone_cut_payload(records=[
+            _zc_rr("www.example.com", "A", "192.0.2.1", ttl=2**31)]),  # ttl 上越界
+        _zone_cut_payload(records=[
+            _zc_rr("www.example.com", "A", "  ")]),                 # rdata 空白
+        _zone_cut_payload(records=[
+            {"owner": "www.example.com", "type": "A",
+             "class": "IN", "ttl": 300}]),                          # 缺 rdata
+        _zone_cut_payload(records=["not-an-object"]),               # 记录非对象
+        "not-an-object",                                            # 请求体非对象
+    ],
+)
+def test_zone_cut_invalid_body_422(client, payload):
+    resp = client.post("/api/zones/example.com/zone-cut-checks", json=payload)
+    assert resp.status_code == 422

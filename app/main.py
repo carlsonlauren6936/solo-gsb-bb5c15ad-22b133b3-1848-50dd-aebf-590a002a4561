@@ -34,6 +34,8 @@ from .schemas import (
     TransferSimulationConflictResponse,
     TransferSimulationCreate,
     TransferSimulationOut,
+    ZoneCutCheckCreate,
+    ZoneCutCheckOut,
     validate_zone,
 )
 from .repair import build_repair_plan
@@ -48,6 +50,7 @@ from .timeline import (
     build_serial_timeline,
 )
 from .transfer import TransferSimulationError, run_transfer_simulation
+from .zonecut import ZoneCutNameError, run_zone_cut_check
 
 
 def _normalize_zone(zone: str) -> str:
@@ -522,6 +525,55 @@ def create_app(db_path: str | None = None) -> FastAPI:
             payload.max_zone_ttl,
             payload.clock_skew_seconds,
         )
+
+    @app.post(
+        "/api/zones/{zone}/zone-cut-checks",
+        response_model=ZoneCutCheckOut,
+        responses={
+            422: {
+                "description": (
+                    "记录 owner 或 NS 目标超出区域（reason=out_of_zone_name，"
+                    "detail 逐项列出越界的 owner 与 NS 目标）；"
+                    "其余请求体字段校验失败同样返回 422"
+                ),
+            }
+        },
+    )
+    def create_zone_cut_check(zone: str, payload: ZoneCutCheckCreate) -> dict:
+        """区域切割与胶水记录预检（仅计算，不写库）。
+
+        提交扁平 RR 列表：非区域顶点的 NS 记录识别为委派切割，每条记录
+        按最长后缀定位最近切割。切割点 NS 保留为权威数据；切割下的普通
+        记录标为 occluded；切割下 owner 恰为该委派 NS 目标且类型为
+        A/AAAA 的记录保留为 glue；未被该委派引用的切割下地址记录标为
+        orphan_glue。返回规范化后的 authoritative_records、glue_records、
+        逐条 violations 与分类计数，结果按 owner/type/rdata 稳定排序；
+        区域外 owner 或 NS 目标返回 422。
+        """
+        zone_name = _normalize_zone(zone)
+        records = [
+            (rr.owner, rr.type, rr.class_, rr.ttl, rr.rdata)
+            for rr in payload.records
+        ]
+        try:
+            result = run_zone_cut_check(zone_name, records)
+        except ZoneCutNameError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "reason": exc.code,
+                    "message": str(exc),
+                    "out_of_zone_owners": exc.owners,
+                    "out_of_zone_ns_targets": exc.ns_targets,
+                },
+            ) from exc
+        result["note"] = (
+            "预检结果仅依据本次请求中的扁平 RR 列表即时计算，不写入数据库；"
+            "非区域顶点的 NS 记录识别为委派切割，每条记录按最长后缀定位最近切割；"
+            "切割点 NS 保留，切割下普通记录为 occluded，owner 恰为该委派 NS 目标的 "
+            "A/AAAA 记录保留为 glue，未被该委派引用的切割下地址记录为 orphan_glue"
+        )
+        return result
 
     return app
 

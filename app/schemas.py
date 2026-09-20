@@ -1138,3 +1138,133 @@ class DnssecRolloverCheckOut(BaseModel):
         description="等待不足的阶段（按阶段顺序；safe 为 true 时为空）"
     )
     note: str
+
+
+# ---------- 区域切割与胶水记录预检 ----------
+
+
+class ZoneCutRecord(BaseModel):
+    """扁平 RR 列表中的单条资源记录（区域切割预检的输入与输出单位）。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description=(
+            "属主名（规范化：去首尾空白、去末尾根点、转小写；"
+            "允许前导下划线标签；须在区域内）"
+        ),
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["A"],
+        description="记录类型助记符（规范化：去首尾空白、转大写）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: str = Field(
+        min_length=1,
+        examples=["192.0.2.1"],
+        description=(
+            "单条记录数据（规范化：去首尾空白，不能为空；"
+            "NS 记录的 rdata 为目标名，须在区域内）"
+        ),
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        return normalize_rr_token(value)
+
+    @field_validator("rdata")
+    @classmethod
+    def _check_rdata(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("rdata 不能为空字符串")
+        return text
+
+
+class ZoneCutCheckCreate(BaseModel):
+    """区域切割与胶水记录预检请求（仅计算，不写库）。"""
+
+    records: list[ZoneCutRecord] = Field(
+        min_length=1,
+        max_length=4096,
+        description=(
+            "扁平 RR 列表（至少 1 条，至多 4096 条；"
+            "owner 与 NS 目标须在区域内，否则 422）"
+        ),
+    )
+
+
+class DelegationCut(BaseModel):
+    """一个委派切割点及其 NS 目标集合。"""
+
+    owner: str = Field(description="切割点属主名（非区域顶点的 NS 记录属主，规范化形式）")
+    ns_targets: list[str] = Field(
+        description="该委派的全部 NS 目标（规范化为小写无尾点，按字典序）"
+    )
+
+
+class ZoneCutViolation(BaseModel):
+    """被切割遮蔽或孤儿胶水记录的逐条违规描述。"""
+
+    index: int = Field(ge=0, description="记录在请求 records 列表中的下标（从 0 起）")
+    category: Literal["occluded", "orphan_glue"] = Field(
+        description=(
+            "occluded=切割下的普通记录被遮蔽；"
+            "orphan_glue=切割下的地址记录未被该委派 NS 目标引用"
+        )
+    )
+    cut: str = Field(description="该记录按最长后缀定位到的最近切割点")
+    record: ZoneCutRecord = Field(description="规范化后的原始记录")
+    message: str
+
+
+class ZoneCutSummary(BaseModel):
+    """区域切割预检的分类计数。"""
+
+    total: int = Field(description="请求记录总数")
+    authoritative: int = Field(description="保留为权威数据的记录数（含切割点 NS）")
+    glue: int = Field(description="保留为胶水记录的 A/AAAA 记录数")
+    occluded: int = Field(description="被切割遮蔽的普通记录数")
+    orphan_glue: int = Field(description="未被该委派引用的切割下地址记录数")
+
+
+class ZoneCutCheckOut(BaseModel):
+    """区域切割与胶水记录预检（200）响应体。"""
+
+    zone: str
+    delegation_cuts: list[DelegationCut] = Field(
+        description="识别出的委派切割点及其 NS 目标（按 owner 字典序）"
+    )
+    authoritative_records: list[ZoneCutRecord] = Field(
+        description="保留为权威数据的规范化记录（按 owner/type/rdata 稳定排序）"
+    )
+    glue_records: list[ZoneCutRecord] = Field(
+        description="保留为胶水记录的规范化 A/AAAA 记录（按 owner/type/rdata 稳定排序）"
+    )
+    violations: list[ZoneCutViolation] = Field(
+        description="occluded/orphan_glue 记录的逐条违规（按 owner/type/rdata 稳定排序）"
+    )
+    summary: ZoneCutSummary = Field(description="分类计数（四类之和等于 total）")
+    note: str
